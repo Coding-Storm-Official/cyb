@@ -1,0 +1,13 @@
+fastapi==0.115.5
+uvicorn[standard]==0.32.0
+python-dotenv==1.0.1
+pydantic==2.9.2
+requests==2.32.3
+urllib3==2.2.3
+numpy==1.26.4
+scikit-learn==1.4.2
+prometheus-client==0.20.0
+kafka-python==2.0.2
+redis==5.0.4
+cryptography==42.0.5
+joblib==1.4.0
