@@ -117,6 +117,20 @@ def home():
         "engine":           "ready" if _engine and _engine.running else "starting",
     }
 
+def _safe_ping(fn, name: str, timeout: float = 2.0) -> bool:
+    """Non-blocking ping with timeout"""
+    import threading
+    result = [False]
+    def _try():
+        try:
+            result[0] = fn()
+        except:
+            pass
+    t = threading.Thread(target=_try, daemon=True)
+    t.start()
+    t.join(timeout=timeout)
+    return result[0]
+
 @app.get("/health", tags=["Health"])
 def health():
     engine = get_engine()
@@ -126,9 +140,9 @@ def health():
         "baseline_pool":    len(engine.baseline),
         "attack_pool":      len(engine.attack),
         "model_ready":      engine.pipeline.ready,
-        "splunk_online":    splunk_ping(),
-        "splunk_ai_online": splunk_ai_ping() if _SPLUNK_AI_AVAILABLE else False,
-        "qwen_online":      qwen_ping() if _QWEN_AVAILABLE else False,
+        "splunk_online":    _safe_ping(splunk_ping, "splunk"),
+        "splunk_ai_online": _safe_ping(splunk_ai_ping, "splunk_ai") if _SPLUNK_AI_AVAILABLE else False,
+        "qwen_online":      _safe_ping(qwen_ping, "qwen") if _QWEN_AVAILABLE else False,
         "ts":               time.time(),
     }
 
@@ -261,6 +275,49 @@ def ml_analyze(
 
     ai_feed = generate_ai_feed(alert_dict, use_qwen=not skip_qwen)
     return {**alert_dict, "ai_feed": ai_feed, "feature_vector": vec.tolist()}
+
+@app.get("/explain-threat/{incident_id}", tags=["Analysis"])
+def explain_threat(
+    incident_id: str = None,
+    _: str = Depends(_require_api_key),
+):
+    """Get a detailed human-friendly explanation of why a threat was flagged."""
+    engine = get_engine()
+    try:
+        alerts = engine.db.query_alerts(since=time.time() - 3600)
+        matching = [a for a in alerts if a.get("incident_id") == incident_id]
+        if not matching:
+            return {"error": "Alert not found", "incident_id": incident_id}
+        alert = matching[0]
+        return {
+            "incident_id": alert["incident_id"],
+            "summary": f"Threat Score: {alert['score']}/100 ({alert['threat']} severity)",
+            "why_it_matters": _explain_threat_type(alert),
+            "triggered_rules": alert.get("rules", []),
+            "behavior_patterns": alert.get("behavior_tags", []),
+            "mitre_tactics": alert.get("mitre", []),
+            "recommended_actions": alert.get("actions", []),
+            "next_likely_attack_stage": alert.get("next_stage", "Unknown"),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+def _explain_threat_type(alert: dict) -> str:
+    """Convert technical threat details into plain English."""
+    threat_map = {
+        "RANSOMWARE": "Files are being encrypted and renamed to lock them away. This looks like ransomware activity.",
+        "INSIDER_THREAT": "A user is accessing multiple sensitive areas and transferring large amounts of data out.",
+        "PRIVILEGE_ESCALATION": "Someone is trying to escalate their permissions to gain higher-level access.",
+        "LATERAL_MOVEMENT": "An attacker is spreading from one computer to another across the network.",
+        "DATA_EXFILTRATION": "Sensitive data is being stolen and sent outside the company.",
+        "PERSISTENCE_ESTABLISHED": "A backdoor or persistent access mechanism is being installed.",
+    }
+    tags = alert.get("behavior_tags", [])
+    explanations = []
+    for tag in tags:
+        if tag in threat_map:
+            explanations.append(threat_map[tag])
+    return " ".join(explanations) if explanations else "Suspicious activity detected that doesn't match common attack patterns."
 
 
 @app.post("/feedback-loop", tags=["Qwen"])

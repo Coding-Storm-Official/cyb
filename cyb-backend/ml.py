@@ -448,28 +448,68 @@ class DetectionPipeline:
         self.sgd    = SGDClassifier(loss="modified_huber", random_state=42)
         self.ready  = False
         self.lock   = Lock()
+        self.iso_weight = 0.15
+        self.rf_weight  = 0.30
+        self.gbm_weight = 0.25
+        self.mlp_weight = 0.20
+        self.sgd_weight = 0.10
     def fit(self, benign: np.ndarray, malicious: np.ndarray):
-        X = np.vstack([benign, malicious])
-        y = np.array([0] * len(benign) + [1] * len(malicious))
-        with self.lock:
-            Xs = self.scaler.fit_transform(X)
-            self.iso.fit(Xs)
-            self.rf.fit(Xs, y)
-            self.gbm.fit(Xs, y)
-            self.mlp.fit(Xs, y)
-            self.sgd.fit(Xs, y)
-            self.ready = True
+        try:
+            X = np.vstack([benign, malicious])
+            y = np.array([0] * len(benign) + [1] * len(malicious))
+            with self.lock:
+                Xs = self.scaler.fit_transform(X)
+                self.iso.fit(Xs)
+                self.rf.fit(Xs, y)
+                self.gbm.fit(Xs, y)
+                self.mlp.fit(Xs, y)
+                self.sgd.fit(Xs, y)
+                self.ready = True
+                logger.info("[Pipeline] Models fitted successfully.")
+        except Exception as e:
+            logger.error(f"[Pipeline] Fit error: {e}")
     def score(self, vec: np.ndarray) -> float:
         with self.lock:
             if not self.ready:
                 return 0.0
-            xs = self.scaler.transform(vec.reshape(1, -1))
-            iso_s = float(abs(self.iso.decision_function(xs)[0])) * 100.0
-            rf_s  = float(self.rf.predict_proba(xs)[0][1])  * 100.0
-            gbm_s = float(self.gbm.predict_proba(xs)[0][1]) * 100.0
-            mlp_s = float(self.mlp.predict_proba(xs)[0][1]) * 100.0
-            sgd_s = float(self.sgd.predict_proba(xs)[0][1]) * 100.0
-            return min((iso_s * 0.15) + (rf_s * 0.30) + (gbm_s * 0.25) + (mlp_s * 0.20) + (sgd_s * 0.10), 100.0)
+            try:
+                xs = self.scaler.transform(vec.reshape(1, -1))
+                iso_s = float(abs(self.iso.decision_function(xs)[0])) * 100.0
+                rf_s  = float(self.rf.predict_proba(xs)[0][1])  * 100.0
+                gbm_s = float(self.gbm.predict_proba(xs)[0][1]) * 100.0
+                mlp_s = float(self.mlp.predict_proba(xs)[0][1]) * 100.0
+                sgd_s = float(self.sgd.predict_proba(xs)[0][1]) * 100.0
+                return min((iso_s * self.iso_weight) + (rf_s * self.rf_weight) + 
+                          (gbm_s * self.gbm_weight) + (mlp_s * self.mlp_weight) + (sgd_s * self.sgd_weight), 100.0)
+            except Exception as e:
+                logger.error(f"[Pipeline] Score error: {e}")
+                return 0.0
+    def explain_score(self, vec: np.ndarray) -> dict:
+        """Return a human-readable explanation of the threat score."""
+        with self.lock:
+            if not self.ready:
+                return {"status": "model_not_ready", "score": 0.0}
+            try:
+                xs = self.scaler.transform(vec.reshape(1, -1))
+                iso_s = float(abs(self.iso.decision_function(xs)[0])) * 100.0
+                rf_s  = float(self.rf.predict_proba(xs)[0][1])  * 100.0
+                gbm_s = float(self.gbm.predict_proba(xs)[0][1]) * 100.0
+                mlp_s = float(self.mlp.predict_proba(xs)[0][1]) * 100.0
+                sgd_s = float(self.sgd.predict_proba(xs)[0][1]) * 100.0
+                final_score = min((iso_s * self.iso_weight) + (rf_s * self.rf_weight) + 
+                                  (gbm_s * self.gbm_weight) + (mlp_s * self.mlp_weight) + (sgd_s * self.sgd_weight), 100.0)
+                return {
+                    "final_score": round(final_score, 2),
+                    "anomaly_detector": round(iso_s, 2),
+                    "random_forest": round(rf_s, 2),
+                    "gradient_boost": round(gbm_s, 2),
+                    "neural_network": round(mlp_s, 2),
+                    "linear_classifier": round(sgd_s, 2),
+                    "model_consensus": "THREAT" if final_score > 65 else "BENIGN",
+                }
+            except Exception as e:
+                logger.error(f"[Pipeline] Explain error: {e}")
+                return {"status": "error", "message": str(e)}
 
 _RANSOM_EXT_SET = {
     ".locked", ".encrypted", ".enc", ".crypt", ".crypted", ".zepto", ".cerber",
@@ -850,6 +890,49 @@ class Engine:
         if "T1041" in mitre or vec[FEATURES.index("net_bytes_out_mb")] > 50:
             tags.append("DATA_EXFILTRATION")
         return tags
+
+    def explain_features(self, vec: np.ndarray) -> dict:
+        """Explain which features contributed most to a high threat score."""
+        try:
+            high_value_features = {}
+            for i, feature_name in enumerate(FEATURES):
+                if vec[i] > 0:
+                    high_value_features[feature_name] = round(float(vec[i]), 3)
+            sorted_features = sorted(high_value_features.items(), key=lambda x: x[1], reverse=True)
+            return {
+                "total_features": len(FEATURES),
+                "active_features": len(high_value_features),
+                "top_10": sorted_features[:10],
+                "explanation": self._explain_top_features(sorted_features[:5])
+            }
+        except Exception as e:
+            logger.error(f"[Engine] Feature explanation error: {e}")
+            return {"error": str(e)}
+
+    def _explain_top_features(self, top_features: list) -> list:
+        """Convert top features into human-friendly explanations."""
+        explanations = []
+        feature_meanings = {
+            "proc_rate_1m": "Processes spawned in last minute",
+            "proc_rate_5m": "Processes spawned in last 5 minutes",
+            "cmd_entropy_avg": "Complexity/obfuscation level of commands",
+            "recon_count": "System reconnaissance attempts",
+            "encoded_ps": "Encoded/obfuscated PowerShell scripts",
+            "service_mods": "Service modifications (stopping AV, etc.)",
+            "log_clear": "Event logs being cleared",
+            "lsass_hits": "LSASS memory access (credential dumping)",
+            "uac_hits": "UAC bypass attempts",
+            "lateral_spread": "Lateral movement to other machines",
+            "encrypt_ext_hits": "Files with ransomware extensions",
+            "entropy_spike_count": "High-entropy file content (encryption)",
+            "shadow_delete_hits": "Shadow copy/backup deletion attempts",
+            "net_bytes_out_mb": "Large data transfers outbound",
+            "persistence_hits": "Persistence mechanism installation",
+        }
+        for feature, value in top_features:
+            meaning = feature_meanings.get(feature, feature)
+            explanations.append(f"• {meaning}: {value}")
+        return explanations
 
     def predict_stage(self, mitre: list) -> Tuple[str, float]:
         stages: List[int] = []
